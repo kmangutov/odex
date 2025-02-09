@@ -1,11 +1,11 @@
 
 
+
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
 import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
-
-
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract CoveredCall {
     address public seller;
@@ -14,8 +14,10 @@ contract CoveredCall {
     uint256 public expiration;
     bool public exercised;
     AggregatorV3Interface internal priceFeed;
+    IERC20 public usdc;
+    uint256 public premium; // Option premium in USDC
 
-    event OptionSold(address indexed buyer);
+    event OptionSold(address indexed buyer, uint256 premium);
     event OptionExercised(address indexed buyer);
     event OptionExpired();
 
@@ -34,19 +36,21 @@ contract CoveredCall {
         _;
     }
 
-    constructor(address _priceFeed, uint256 _strikePrice, uint256 _expiration) payable {
+    constructor(address _priceFeed, address _usdc, uint256 _strikePrice, uint256 _expiration, uint256 _premium) payable {
         require(msg.value > 0, "Must escrow ETH");
         seller = msg.sender;
         strikePrice = _strikePrice;
         expiration = _expiration;
         priceFeed = AggregatorV3Interface(_priceFeed);
+        usdc = IERC20(_usdc);
+        premium = _premium;
     }
 
-    function buyOption() external payable notExpired {
+    function buyOption() external notExpired {
         require(buyer == address(0), "Option already sold");
-        require(msg.value > 0, "Must pay premium");
+        require(usdc.transferFrom(msg.sender, seller, premium), "USDC transfer failed");
         buyer = msg.sender;
-        emit OptionSold(msg.sender);
+        emit OptionSold(msg.sender, premium);
     }
 
     function exerciseOption() external payable onlyBuyer notExpired {
@@ -63,5 +67,19 @@ contract CoveredCall {
         require(!exercised, "Already exercised");
         payable(seller).transfer(address(this).balance);
         emit OptionExpired();
+    }
+
+    function autoExercise() external {
+        // Stub function: This should be called automatically on expiration or via off-chain logic
+        if (block.timestamp >= expiration && !exercised) {
+            (, int256 price, , , ) = priceFeed.latestRoundData();
+            if (uint256(price) >= strikePrice) {
+                exercised = true;
+                payable(seller).transfer(address(this).balance);
+                emit OptionExercised(buyer);
+            } else {
+                emit OptionExpired();
+            }
+        }
     }
 }

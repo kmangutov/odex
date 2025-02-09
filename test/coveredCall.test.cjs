@@ -2,23 +2,44 @@ const { expect } = require("chai");
 const { ethers } = require("hardhat");
 
 describe("CoveredCall", function () {
-    let CoveredCall, coveredCall, owner, buyer, priceFeedMock, strikePrice, expiration;
+    let CoveredCall, coveredCall, owner, buyer, usdcMock, priceFeedMock;
+    let strikePrice, expiration, premium;
 
-    beforeEach(async function () {
-        [owner, buyer] = await ethers.getSigners();
+beforeEach(async function () {
+    [owner, buyer] = await ethers.getSigners();
 
-        // Mock Chainlink price feed
-        const PriceFeedMock = await ethers.getContractFactory("PriceFeedMock");
-        priceFeedMock = await PriceFeedMock.deploy();
-        await priceFeedMock.deployed();
+    // Mock Chainlink price feed
+    const PriceFeedMock = await ethers.getContractFactory("PriceFeedMock");
+    priceFeedMock = await PriceFeedMock.deploy();
+    await priceFeedMock.waitForDeployment(); // Ensure it fully deploys
+    const priceFeedAddress = await priceFeedMock.getAddress(); // Get correct address
 
-        strikePrice = ethers.utils.parseUnits("2000", 18); // $2000 strike price
-        expiration = (await ethers.provider.getBlock("latest")).timestamp + 86400; // 1 day from now
+    // Mock USDC token
+    const USDCMock = await ethers.getContractFactory("USDCMock");
+    usdcMock = await USDCMock.deploy();
+    await usdcMock.waitForDeployment(); // Ensure it fully deploys
+    const usdcAddress = await usdcMock.getAddress(); // Get correct address
 
-        CoveredCall = await ethers.getContractFactory("CoveredCall");
-        coveredCall = await CoveredCall.deploy(priceFeedMock.address, strikePrice, expiration, { value: ethers.utils.parseUnits("1", 18) });
-        await coveredCall.deployed();
-    });
+    // Mint USDC for buyer
+    await usdcMock.mint(buyer.address, ethers.parseUnits("1000", 6));
+
+    strikePrice = ethers.parseUnits("55", 18);
+    expiration = (await ethers.provider.getBlock("latest")).timestamp + 86400 * 180;
+    premium = ethers.parseUnits("4", 6);
+
+    CoveredCall = await ethers.getContractFactory("CoveredCall");
+    coveredCall = await CoveredCall.deploy(
+        priceFeedAddress,  // ✅ Use valid address
+        usdcAddress,       // ✅ Use valid address
+        strikePrice,
+        expiration,
+        premium,
+        { value: ethers.parseUnits("1", 18) }
+    );
+    await coveredCall.waitForDeployment();
+});
+
+    
 
     it("Should initialize contract correctly", async function () {
         expect(await coveredCall.seller()).to.equal(owner.address);
@@ -26,28 +47,63 @@ describe("CoveredCall", function () {
         expect(await coveredCall.expiration()).to.equal(expiration);
     });
 
-    it("Should allow a buyer to purchase the option", async function () {
-        await coveredCall.connect(buyer).buyOption({ value: ethers.utils.parseUnits("0.1", 18) });
-        expect(await coveredCall.buyer()).to.equal(buyer.address);
-    });
+    it("Bullish Case: Option is exercised when ITM", async function () {
+        await usdcMock.connect(buyer).approve(await coveredCall.getAddress(), premium);
+        await coveredCall.connect(buyer).buyOption();
+      
+        // Simulate price rising to $60 (ITM)
+        await priceFeedMock.setLatestPrice(ethers.parseUnits("60", 18));
+      
+        // Increase time using ethers.provider
+        await ethers.provider.send("evm_increaseTime", [86400 * 181]); 
+        await ethers.provider.send("evm_mine", []);
+      
+        await coveredCall.connect(buyer).exerciseOption({
+          value: ethers.parseUnits("55", 18),
+        });
+      
+        expect(await ethers.provider.getBalance(coveredCall.address)).to.equal(0);
+      });
+      
+    
 
-    it("Should allow buyer to exercise option if ITM", async function () {
-        await coveredCall.connect(buyer).buyOption({ value: ethers.utils.parseUnits("0.1", 18) });
+    it("Bullish Case: Option is exercised when ITM", async function () {
+        await usdcMock.connect(buyer).approve(coveredCall.address, premium);
+        await coveredCall.connect(buyer).buyOption();
 
-        // Simulate ITM price ($2100)
-        await priceFeedMock.setLatestPrice(ethers.utils.parseUnits("2100", 18));
+        // Simulate price rising to $60 (ITM)
+        await priceFeedMock.setLatestPrice(ethers.utils.parseUnits("60", 18));
 
-        await coveredCall.connect(buyer).exerciseOption({ value: ethers.utils.parseUnits("2", 18) });
+        await coveredCall.connect(buyer).exerciseOption({ value: ethers.utils.parseUnits("55", 18) });
 
         expect(await ethers.provider.getBalance(coveredCall.address)).to.equal(0);
     });
 
-    it("Should allow seller to reclaim escrowed ETH if OTM on expiration", async function () {
-        await network.provider.send("evm_increaseTime", [86400]); // Fast forward 1 day
+    it("Bearish Case: Option expires worthless when OTM", async function () {
+        await usdcMock.connect(buyer).approve(coveredCall.address, premium);
+        await coveredCall.connect(buyer).buyOption();
+
+        // Simulate price dropping to $40 (OTM)
+        await priceFeedMock.setLatestPrice(ethers.utils.parseUnits("40", 18));
+
+        await network.provider.send("evm_increaseTime", [86400 * 181]); // Fast forward 6 months
         await network.provider.send("evm_mine");
 
         await coveredCall.connect(owner).expireWorthless();
         expect(await ethers.provider.getBalance(coveredCall.address)).to.equal(0);
     });
-});
 
+    it("Should allow auto exercise function to trigger execution", async function () {
+        await usdcMock.connect(buyer).approve(coveredCall.address, premium);
+        await coveredCall.connect(buyer).buyOption();
+
+        // Simulate price rising to $60
+        await priceFeedMock.setLatestPrice(ethers.utils.parseUnits("60", 18));
+
+        await network.provider.send("evm_increaseTime", [86400 * 181]); // Fast forward 6 months
+        await network.provider.send("evm_mine");
+
+        await coveredCall.autoExercise();
+        expect(await ethers.provider.getBalance(coveredCall.address)).to.equal(0);
+    });
+});
