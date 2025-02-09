@@ -5,39 +5,42 @@ describe("CoveredCall", function () {
     let CoveredCall, coveredCall, owner, buyer, usdcMock, priceFeedMock;
     let strikePrice, expiration, premium;
 
-beforeEach(async function () {
-    [owner, buyer] = await ethers.getSigners();
-
-    // Mock Chainlink price feed
-    const PriceFeedMock = await ethers.getContractFactory("PriceFeedMock");
-    priceFeedMock = await PriceFeedMock.deploy();
-    await priceFeedMock.waitForDeployment(); // Ensure it fully deploys
-    const priceFeedAddress = await priceFeedMock.getAddress(); // Get correct address
-
-    // Mock USDC token
-    const USDCMock = await ethers.getContractFactory("USDCMock");
-    usdcMock = await USDCMock.deploy();
-    await usdcMock.waitForDeployment(); // Ensure it fully deploys
-    const usdcAddress = await usdcMock.getAddress(); // Get correct address
-
-    // Mint USDC for buyer
-    await usdcMock.mint(buyer.address, ethers.parseUnits("1000", 6));
-
-    strikePrice = ethers.parseUnits("55", 18);
-    expiration = (await ethers.provider.getBlock("latest")).timestamp + 86400 * 180;
-    premium = ethers.parseUnits("4", 6);
-
-    CoveredCall = await ethers.getContractFactory("CoveredCall");
-    coveredCall = await CoveredCall.deploy(
-        priceFeedAddress,  // ✅ Use valid address
-        usdcAddress,       // ✅ Use valid address
-        strikePrice,
-        expiration,
-        premium,
-        { value: ethers.parseUnits("1", 18) }
-    );
-    await coveredCall.waitForDeployment();
-});
+    
+    beforeEach(async function () {
+        [owner, buyer] = await ethers.getSigners();
+    
+        // Deploy Chainlink Price Feed Mock
+        const PriceFeedMock = await ethers.getContractFactory("PriceFeedMock");
+        priceFeedMock = await PriceFeedMock.deploy();
+        await priceFeedMock.waitForDeployment();
+        const priceFeedAddress = await priceFeedMock.getAddress(); // ✅ Get correct address
+    
+        // Deploy USDC Mock
+        const USDCMock = await ethers.getContractFactory("USDCMock");
+        usdcMock = await USDCMock.deploy();
+        await usdcMock.waitForDeployment();
+        const usdcAddress = await usdcMock.getAddress(); // ✅ Get correct address
+    
+        // Mint USDC for the buyer
+        await usdcMock.mint(buyer.address, ethers.parseUnits("1000", 6));
+    
+        // Set contract parameters
+        strikePrice = ethers.parseUnits("55", 18);
+        expiration = (await ethers.provider.getBlock("latest")).timestamp + 86400 * 180; // 6 months from now
+        premium = ethers.parseUnits("4", 6);
+    
+        // Deploy CoveredCall contract with correct addresses
+        CoveredCall = await ethers.getContractFactory("CoveredCall");
+        coveredCall = await CoveredCall.deploy(
+            priceFeedAddress,  // ✅ Ensure it's a valid address
+            usdcAddress,       // ✅ Ensure it's a valid address
+            strikePrice,
+            expiration,
+            premium,
+            { value: ethers.parseUnits("1", 18) } // Escrow 1 ETH
+        );
+        await coveredCall.waitForDeployment();
+    });
 
     
 
@@ -47,63 +50,69 @@ beforeEach(async function () {
         expect(await coveredCall.expiration()).to.equal(expiration);
     });
 
+
     it("Bullish Case: Option is exercised when ITM", async function () {
-        await usdcMock.connect(buyer).approve(await coveredCall.getAddress(), premium);
+        const ccAddr = await coveredCall.getAddress();
+      
+        await usdcMock.connect(buyer).approve(ccAddr, premium);
         await coveredCall.connect(buyer).buyOption();
       
-        // Simulate price rising to $60 (ITM)
+        // Price goes above strike
         await priceFeedMock.setLatestPrice(ethers.parseUnits("60", 18));
       
-        // Increase time using ethers.provider
-        await ethers.provider.send("evm_increaseTime", [86400 * 181]); 
+        // Increase time *just under* expiration
+        await ethers.provider.send("evm_increaseTime", [86400 * 100]);
         await ethers.provider.send("evm_mine", []);
       
+        // Exercise
         await coveredCall.connect(buyer).exerciseOption({
           value: ethers.parseUnits("55", 18),
         });
       
-        expect(await ethers.provider.getBalance(coveredCall.address)).to.equal(0);
+        // Check final balance of contract is zero
+        expect(await ethers.provider.getBalance(ccAddr)).to.equal(0n);
       });
       
-    
 
-    it("Bullish Case: Option is exercised when ITM", async function () {
-        await usdcMock.connect(buyer).approve(coveredCall.address, premium);
-        await coveredCall.connect(buyer).buyOption();
 
-        // Simulate price rising to $60 (ITM)
-        await priceFeedMock.setLatestPrice(ethers.utils.parseUnits("60", 18));
+ it("Bearish Case: Option expires worthless when OTM", async function () {
+    const ccAddr = await coveredCall.getAddress();
 
-        await coveredCall.connect(buyer).exerciseOption({ value: ethers.utils.parseUnits("55", 18) });
+    await usdcMock.connect(buyer).approve(ccAddr, premium);
+    await coveredCall.connect(buyer).buyOption();
 
-        expect(await ethers.provider.getBalance(coveredCall.address)).to.equal(0);
-    });
+    // Simulate price dropping to $40 (OTM)
+    await priceFeedMock.setLatestPrice(ethers.parseUnits("40", 18));
 
-    it("Bearish Case: Option expires worthless when OTM", async function () {
-        await usdcMock.connect(buyer).approve(coveredCall.address, premium);
-        await coveredCall.connect(buyer).buyOption();
+    // Increase time to AFTER expiration (180+ days)
+    await ethers.provider.send("evm_increaseTime", [86400 * 181]); // ✅ Expired
+    await ethers.provider.send("evm_mine", []);
 
-        // Simulate price dropping to $40 (OTM)
-        await priceFeedMock.setLatestPrice(ethers.utils.parseUnits("40", 18));
+    // Seller should now be able to reclaim funds
+    await coveredCall.connect(owner).expireWorthless();
 
-        await network.provider.send("evm_increaseTime", [86400 * 181]); // Fast forward 6 months
-        await network.provider.send("evm_mine");
+    // Ensure contract balance is zero
+    expect(await ethers.provider.getBalance(ccAddr)).to.equal(0n);
+});
 
-        await coveredCall.connect(owner).expireWorthless();
-        expect(await ethers.provider.getBalance(coveredCall.address)).to.equal(0);
-    });
+it("Should allow auto exercise function to trigger execution", async function () {
+    const ccAddr = await coveredCall.getAddress();
 
-    it("Should allow auto exercise function to trigger execution", async function () {
-        await usdcMock.connect(buyer).approve(coveredCall.address, premium);
-        await coveredCall.connect(buyer).buyOption();
+    await usdcMock.connect(buyer).approve(ccAddr, premium);
+    await coveredCall.connect(buyer).buyOption();
 
-        // Simulate price rising to $60
-        await priceFeedMock.setLatestPrice(ethers.utils.parseUnits("60", 18));
+    // Simulate price rising to $60 (ITM)
+    await priceFeedMock.setLatestPrice(ethers.parseUnits("60", 18));
 
-        await network.provider.send("evm_increaseTime", [86400 * 181]); // Fast forward 6 months
-        await network.provider.send("evm_mine");
+    // Increase time past expiration
+    await ethers.provider.send("evm_increaseTime", [86400 * 181]); // ✅ Expired
+    await ethers.provider.send("evm_mine", []);
 
-        await coveredCall.autoExercise();
-        expect(await ethers.provider.getBalance(coveredCall.address)).to.equal(0);
-    });
+    // Call auto-exercise, expecting it to execute correctly
+    await coveredCall.autoExercise();
+
+    // Ensure contract balance is zero
+    expect(await ethers.provider.getBalance(ccAddr)).to.equal(0n);
+});
+
 });
